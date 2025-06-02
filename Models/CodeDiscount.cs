@@ -1,6 +1,6 @@
 ﻿namespace DiscountCodeService.Models;
 
-public sealed class CodeDiscount
+public class CodeDiscount
 {
 	public int Id { get; set; }
 	public string Code { get; set; } = string.Empty;

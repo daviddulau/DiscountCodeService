@@ -1,76 +1,73 @@
-﻿using System.Threading.Channels;
+﻿using DiscountCodeService.Models;
+using System.Collections.Concurrent;
+using System.Text;
+using System.Threading.Channels;
 
 namespace DiscountCodeService.Loggers;
 
 public class LoggerProvider : ILoggerProvider
 {
-	private readonly Channel<LogEntry> _channel = Channel.CreateUnbounded<LogEntry>(new UnboundedChannelOptions
-	{
-		SingleReader = true,
-		SingleWriter = false
-	});
-	private readonly Task _processor;
-	private readonly StreamWriter _file;
-	private volatile bool _disposed;
+	private readonly Channel<LogMessage> _channel;
+	private readonly CancellationTokenSource _cts = new();
+	private readonly Task _backgroundWriter;
+	private static readonly ConcurrentDictionary<string, Lazy<StreamWriter>> Writers = new();
 
-	public LoggerProvider(string filePath)
+	public LoggerProvider(string logPath, IFormatProvider? formatProvider = null)
 	{
-		Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
-		_file = new StreamWriter(new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.Read, 8192, true));
-		_processor = Task.Run(ProcessQueueAsync);
+		_channel = Channel.CreateBounded<LogMessage>(new BoundedChannelOptions(10_000)
+		{
+			SingleReader = true,
+			SingleWriter = false,
+			FullMode = BoundedChannelFullMode.DropWrite
+		});
+
+		// ensure directory exists
+		Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+
+		// single writer per *file*, shared across providers
+		var writer = Writers.GetOrAdd(logPath, p => new Lazy<StreamWriter>(() =>
+		{
+			var fs = new FileStream(
+				p,
+				FileMode.Append,
+				FileAccess.Write,
+				FileShare.ReadWrite | FileShare.Delete,
+				4096,
+				FileOptions.Asynchronous | FileOptions.WriteThrough);
+
+			return new StreamWriter(fs, Encoding.UTF8) { AutoFlush = true };
+		})).Value;
+
+		_backgroundWriter = Task.Run(() => ProcessQueueAsync(writer, _cts.Token));
 	}
 
-	public ILogger CreateLogger(string category) => new Logger(category, _channel.Writer);
+	public ILogger CreateLogger(string categoryName)
+		=> new ChannelLogger(categoryName, _channel.Writer);
 
 	public void Dispose()
 	{
-		if (_disposed) return;
-		_disposed = true;
-		_channel.Writer.TryComplete();
-		try { _processor.Wait(); } catch { /* ignored */ }
-		_file.Dispose();
+		_cts.Cancel();
+		_backgroundWriter.Wait();
 	}
 
-	private async Task ProcessQueueAsync()
+	private async Task ProcessQueueAsync(StreamWriter writer, CancellationToken ct)
 	{
-		await foreach (var e in _channel.Reader.ReadAllAsync())
+		try
 		{
+			await foreach (var msg in _channel.Reader.ReadAllAsync(ct))
+			{
+				await writer.WriteLineAsync(msg.Format());
+			}
+		}
+		catch (OperationCanceledException) { /* normal shutdown */ }
+		catch (Exception ex)
+		{
+			// last-chance logging; swallow so the app never crashes
 			try
 			{
-				await _file.WriteLineAsync($"{e.Timestamp:O}|{e.Level}|{e.Category}|{e.Message}");
-				if (e.Exception is not null)
-					await _file.WriteLineAsync(e.Exception.ToString());
+				File.AppendAllText("fatal.log", ex.ToString());
 			}
-			catch (Exception ex)
-			{
-				// swallow to avoid crashing app per requirement 4
-				Console.Error.WriteLine(ex);
-			}
+			catch { }
 		}
-		await _file.FlushAsync();
-	}
-
-	private record LogEntry(DateTime Timestamp, LogLevel Level, string Category, string Message, Exception? Exception);
-
-	private class Logger : ILogger
-	{
-		private readonly string _category;
-		private readonly ChannelWriter<LogEntry> _writer;
-
-		public Logger(string category, ChannelWriter<LogEntry> writer)
-		{
-			_category = category;
-			_writer = writer;
-		}
-
-		public IDisposable BeginScope<TState>(TState state) => NullScope.Instance;
-		public bool IsEnabled(LogLevel logLevel) => true;
-
-		public void Log<TState>(LogLevel level, EventId id, TState state, Exception? ex, Func<TState, Exception?, string> formatter)
-		{
-			_writer.TryWrite(new LogEntry(DateTime.UtcNow, level, _category, formatter(state, ex), ex));
-		}
-
-		private sealed class NullScope : IDisposable { public static readonly NullScope Instance = new(); public void Dispose() { } }
 	}
 }

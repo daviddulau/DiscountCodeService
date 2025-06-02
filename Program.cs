@@ -12,8 +12,7 @@ namespace DiscountCodeService;
 
 		builder.WebHost.ConfigureKestrel(o =>
 		{
-			o.ListenAnyIP(5000, p => p.Protocols = HttpProtocols.Http2);
-			// generous limits for high‑throughput traffic
+			o.ListenAnyIP(5059, p => p.Protocols = HttpProtocols.Http2);
 			o.Limits.MaxRequestHeaderCount = 128;
 			o.AddServerHeader = false;
 		});

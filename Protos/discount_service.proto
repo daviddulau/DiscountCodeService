@@ -11,7 +11,7 @@ message GenerateRequest {
 
 message GenerateResponse {
   bool result = 1;
-  repeated string codes  = 2;
+  repeated string codes = 2;
 }
 
 enum UseCodeResult {
